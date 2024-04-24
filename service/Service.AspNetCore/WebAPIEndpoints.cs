@@ -229,7 +229,7 @@ public static class WebAPIEndpoints
     {
         RouteGroupBuilder group = builder.MapGroup(apiPrefix);
 
-        // Ask endpoint
+        // Ask streaming endpoint
         var route = group.MapPost(Constants.HttpAskStreamEndpoint,
                 async IAsyncEnumerable<string> (
                     MemoryQuery query,
