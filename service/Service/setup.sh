@@ -4,6 +4,6 @@ if [ -f "Microsoft.KernelMemory.ServiceAssembly.dll" ]; then
     dotnet Microsoft.KernelMemory.ServiceAssembly.dll setup
 else
     dotnet clean
-    dotnet build -c Debug -p "SolutionName=KernelMemory"
+    dotnet build -c Debug -p "SolutionName=KernelMemoryDev"
     ASPNETCORE_ENVIRONMENT=Development dotnet run setup --no-build --no-restore
 fi

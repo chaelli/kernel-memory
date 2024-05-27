@@ -5,5 +5,5 @@ set -e
 cd "$(dirname "${BASH_SOURCE[0]:-$0}")"
 
 dotnet clean
-dotnet build -c Debug -p "SolutionName=KernelMemory"
+dotnet build -c Debug -p "SolutionName=KernelMemoryDev"
 ASPNETCORE_ENVIRONMENT=Development dotnet run --no-build --no-restore

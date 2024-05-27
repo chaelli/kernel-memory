@@ -1,6 +1,4 @@
-﻿// Copyright (c) Microsoft. All rights reserved.
-
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.AspNetCore.Builder;
@@ -13,6 +11,9 @@ using Microsoft.KernelMemory.ContentStorage;
 using Microsoft.KernelMemory.Diagnostics;
 using Microsoft.KernelMemory.MemoryStorage;
 using Microsoft.KernelMemory.Pipeline;
+using Microsoft.ApplicationInsights.AspNetCore.Extensions;
+using Microsoft.KernelMemory.Prompts;
+using Microsoft.KernelMemory.Search;
 
 // KM Configuration:
 //
@@ -56,6 +57,7 @@ internal static class Program
 
         // Usual .NET web app builder with settings from appsettings.json, appsettings.<ENV>.json, and env vars
         WebApplicationBuilder appBuilder = WebApplication.CreateBuilder();
+
         appBuilder.Configuration.AddKMConfigurationSources();
 
         // Read KM settings, needed before building the app.
@@ -64,9 +66,15 @@ internal static class Program
 
         // Some OpenAPI Explorer/Swagger dependencies
         appBuilder.ConfigureSwagger(config);
+        appBuilder.Services.AddApplicationInsightsTelemetry(options =>
+        {
+            options.ConnectionString = appBuilder.Configuration["ApplicationInsights:ConnectionString"];
+        });
+
 
         // Prepare memory builder, sharing the service collection used by the hosting service
-        var memoryBuilder = new KernelMemoryBuilder(appBuilder.Services).WithoutDefaultHandlers();
+        var memoryBuilder = new KernelMemoryBuilder(appBuilder.Services).WithoutDefaultHandlers()
+        .WithCustomPromptProvider(new ViuPromptProvider());
 
         // When using distributed orchestration, handlers are hosted in the current app
         var asyncHandlersCount = AddHandlersToHostingApp(config, memoryBuilder, appBuilder);
@@ -162,5 +170,34 @@ internal static class Program
         }
 
         return orchestrator.HandlerNames.Count;
+    }
+}
+
+internal class ViuPromptProvider : IPromptProvider
+{
+    private readonly EmbeddedPromptProvider _fallbackProvider = new();
+    private const string AskPrompt = """
+            Facts:
+            {{$facts}}
+            ======
+            Given only the facts above, provide a comprehensive/detailed answer.
+            You don't know where the knowledge comes from, just answer.
+            If you don't have sufficient information, reply with '{{$notFound}}'.
+            For every paragraph, add the source in the form (markdown-formatted-link)
+            Question: {{$input}}
+            Answer:
+            """;
+
+    public string ReadPrompt(string promptName)
+    {
+        switch (promptName)
+        {
+            case Constants.PromptNamesAnswerWithFacts:
+                return AskPrompt;
+
+            default:
+                // Fall back to the default
+                return this._fallbackProvider.ReadPrompt(promptName);
+        }
     }
 }

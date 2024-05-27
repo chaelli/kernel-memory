@@ -13,6 +13,9 @@ public static class Constants
     // Form field containing the Document ID
     public const string WebServiceDocumentIdField = "documentId";
 
+    // Form field containing the URL to index
+    public const string WebServiceUrlField = "url";
+
     // Form field containing the list of tags
     public const string WebServiceTagsField = "tags";
 
@@ -51,6 +54,7 @@ public static class Constants
     public const string HttpAskEndpoint = "/ask";
     public const string HttpSearchEndpoint = "/search";
     public const string HttpUploadEndpoint = "/upload";
+    public const string HttpAddUrlEndpoint = "/addurl";
     public const string HttpUploadStatusEndpoint = "/upload-status";
     public const string HttpDocumentsEndpoint = "/documents";
     public const string HttpIndexesEndpoint = "/indexes";

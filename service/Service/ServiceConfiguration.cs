@@ -11,6 +11,7 @@ using Microsoft.KernelMemory.MemoryStorage;
 using Microsoft.KernelMemory.MemoryStorage.DevTools;
 using Microsoft.KernelMemory.Pipeline.Queue.DevTools;
 using Microsoft.KernelMemory.Postgres;
+using Microsoft.KernelMemory.Search;
 
 namespace Microsoft.KernelMemory.Service;
 
@@ -300,6 +301,8 @@ internal sealed class ServiceConfiguration
     private void ConfigureSearchClient(IKernelMemoryBuilder builder)
     {
         // Search settings
+        //builder.Services.AddSingleton<Search.ISearchClient, ViuSearchClient>();
+        //builder.WithCustomSearchClient(builder.Services.BuildServiceProvider().GetService<ISearchClient>());
         builder.WithSearchClientConfig(this._memoryConfiguration.Retrieval.SearchClient);
     }
 
