@@ -167,69 +167,9 @@ internal sealed class SearchClient : ISearchClient
             return noAnswerFound;
         }
 
-        var facts = new StringBuilder();
-        var maxTokens = this._config.MaxAskPromptSize > 0
-            ? this._config.MaxAskPromptSize
-            : this._textGenerator.MaxTokenTotal;
-        var tokensAvailable = maxTokens
-                              - this._textGenerator.CountTokens(this._answerPrompt)
-                              - this._textGenerator.CountTokens(question)
-                              - this._config.AnswerTokens;
-
-        var factsUsedCount = 0;
-        var factsAvailableCount = 0;
+        var (facts, relevantSources, factsUsedCount, factsAvailableCount) = await this.GetFactsAsync(question, index, filters, minRelevance, cancellationToken).ConfigureAwait(false);
         var answer = noAnswerFound;
-
-        this._log.LogTrace("Fetching relevant memories");
-        IAsyncEnumerable<(MemoryRecord, double)> matches = this._memoryDb.GetSimilarListAsync(
-            index: index,
-            text: question,
-            filters: filters,
-            minRelevance: minRelevance,
-            limit: this._config.MaxMatchesCount,
-            withEmbeddings: false,
-            cancellationToken: cancellationToken);
-
-        // Memories are sorted by relevance, starting from the most relevant
-        await foreach ((MemoryRecord memory, double relevance) in matches.ConfigureAwait(false))
-        {
-            string fileName = memory.GetFileName(this._log);
-
-            string webPageUrl = memory.GetWebPageUrl(index);
-
-            var partitionText = memory.GetPartitionText(this._log).Trim();
-            if (string.IsNullOrEmpty(partitionText))
-            {
-                this._log.LogError("The document partition is empty, doc: {0}", memory.Id);
-                continue;
-            }
-
-            factsAvailableCount++;
-
-            var fact = GenerateFactString(fileName, relevance, partitionText);
-
-            // Use the partition/chunk only if there's room for it
-            var size = this._textGenerator.CountTokens(fact);
-            if (size >= tokensAvailable)
-            {
-                // Stop after reaching the max number of tokens
-                break;
-            }
-
-            factsUsedCount++;
-            this._log.LogTrace("Adding text {0} with relevance {1}", factsUsedCount, relevance);
-
-            facts.Append(fact);
-            tokensAvailable -= size;
-
-            this.MapMatchToCitation(index, answer.RelevantSources, memory, relevance);
-
-            // In cases where a buggy storage connector is returning too many records
-            if (factsUsedCount >= this._config.MaxMatchesCount)
-            {
-                break;
-            }
-        }
+        answer.RelevantSources = relevantSources;
 
         if (factsAvailableCount > 0 && factsUsedCount == 0)
         {
@@ -249,7 +189,7 @@ internal sealed class SearchClient : ISearchClient
         var charsGenerated = 0;
         var watch = new Stopwatch();
         watch.Restart();
-        await foreach (var x in this.GenerateAnswer(question, facts.ToString())
+        await foreach (var x in this.GenerateAnswerAsync(question, facts.ToString())
                            .WithCancellation(cancellationToken).ConfigureAwait(false))
         {
             text.Append(x);
@@ -302,67 +242,9 @@ internal sealed class SearchClient : ISearchClient
             yield break;
         }
 
-        var facts = new StringBuilder();
-        var maxTokens = this._config.MaxAskPromptSize > 0
-            ? this._config.MaxAskPromptSize
-            : this._textGenerator.MaxTokenTotal;
-        var tokensAvailable = maxTokens
-                              - this._textGenerator.CountTokens(this._answerPrompt)
-                              - this._textGenerator.CountTokens(question)
-                              - this._config.AnswerTokens;
-
-        var factsUsedCount = 0;
-        var factsAvailableCount = 0;
+        var (facts, relevantSources, factsUsedCount, factsAvailableCount) = await this.GetFactsAsync(question, index, filters, minRelevance, cancellationToken).ConfigureAwait(false);
         var answer = noAnswerFound;
-
-        this._log.LogTrace("Fetching relevant memories");
-        IAsyncEnumerable<(MemoryRecord, double)> matches = this._memoryDb.GetSimilarListAsync(
-            index: index,
-            text: question,
-            filters: filters,
-            minRelevance: minRelevance,
-            limit: this._config.MaxMatchesCount,
-            withEmbeddings: false,
-            cancellationToken: cancellationToken);
-
-        // Memories are sorted by relevance, starting from the most relevant
-        await foreach ((MemoryRecord memory, double relevance) in matches.ConfigureAwait(false))
-        {
-            string fileName = memory.GetFileName(this._log);
-
-            var partitionText = memory.GetPartitionText(this._log).Trim();
-            if (string.IsNullOrEmpty(partitionText))
-            {
-                this._log.LogError("The document partition is empty, doc: {0}", memory.Id);
-                continue;
-            }
-
-            factsAvailableCount++;
-
-            var fact = GenerateFactString(fileName, relevance, partitionText);
-
-            // Use the partition/chunk only if there's room for it
-            var size = this._textGenerator.CountTokens(fact);
-            if (size >= tokensAvailable)
-            {
-                // Stop after reaching the max number of tokens
-                break;
-            }
-
-            factsUsedCount++;
-            this._log.LogTrace("Adding text {0} with relevance {1}", factsUsedCount, relevance);
-
-            facts.Append(fact);
-            tokensAvailable -= size;
-
-            this.MapMatchToCitation(index, answer.RelevantSources, memory, relevance);
-
-            // In cases where a buggy storage connector is returning too many records
-            if (factsUsedCount >= this._config.MaxMatchesCount)
-            {
-                break;
-            }
-        }
+        answer.RelevantSources = relevantSources;
 
         if (factsAvailableCount > 0 && factsUsedCount == 0)
         {
@@ -480,10 +362,10 @@ internal sealed class SearchClient : ISearchClient
         return string.Equals(value, target, StringComparison.OrdinalIgnoreCase);
     }
 
-    private static string GenerateFactString(string fileName, double relevance, string partitionText)
+    private static string GenerateFactString(string fileName, string webPageUrl, double relevance, string partitionText)
     {
         // TODO: add file age in days, to push relevance of newer documents
-        var fact = $"==== [File:{(fileName == "content.url" ? webPageUrl : fileName)};Relevance:{relevance:P1}]:\n{partitionText}\n";
+        return $"==== [File:{(fileName == "content.url" ? webPageUrl : fileName)};Relevance:{relevance:P1}]:\n{partitionText}\n";
     }
 
     private void MapMatchToCitation(string index, List<Citation> citations, MemoryRecord memory, double relevance)
@@ -525,5 +407,74 @@ internal sealed class SearchClient : ISearchClient
             LastUpdate = memory.GetLastUpdate(),
             Tags = memory.Tags,
         });
+    }
+
+    private async Task<(string, List<Citation>, int, int)> GetFactsAsync(string question, string index, ICollection<MemoryFilter>? filters, double minRelevance, CancellationToken cancellationToken)
+    {
+        var relevantSources = new List<Citation>();
+        var facts = new StringBuilder();
+        var maxTokens = this._config.MaxAskPromptSize > 0
+            ? this._config.MaxAskPromptSize
+            : this._textGenerator.MaxTokenTotal;
+        var tokensAvailable = maxTokens
+                              - this._textGenerator.CountTokens(this._answerPrompt)
+                              - this._textGenerator.CountTokens(question)
+                              - this._config.AnswerTokens;
+
+        var factsUsedCount = 0;
+        var factsAvailableCount = 0;
+
+        this._log.LogTrace("Fetching relevant memories");
+        IAsyncEnumerable<(MemoryRecord, double)> matches = this._memoryDb.GetSimilarListAsync(
+            index: index,
+            text: question,
+            filters: filters,
+            minRelevance: minRelevance,
+            limit: this._config.MaxMatchesCount,
+            withEmbeddings: false,
+            cancellationToken: cancellationToken);
+
+        // Memories are sorted by relevance, starting from the most relevant
+        await foreach ((MemoryRecord memory, double relevance) in matches.ConfigureAwait(false))
+        {
+            string fileName = memory.GetFileName(this._log);
+
+            string webPageUrl = memory.GetWebPageUrl(index);
+
+            var partitionText = memory.GetPartitionText(this._log).Trim();
+            if (string.IsNullOrEmpty(partitionText))
+            {
+                this._log.LogError("The document partition is empty, doc: {0}", memory.Id);
+                continue;
+            }
+
+            factsAvailableCount++;
+
+            var fact = GenerateFactString(fileName, webPageUrl, relevance, partitionText);
+
+            // Use the partition/chunk only if there's room for it
+            var size = this._textGenerator.CountTokens(fact);
+            if (size >= tokensAvailable)
+            {
+                // Stop after reaching the max number of tokens
+                break;
+            }
+
+            factsUsedCount++;
+            this._log.LogTrace("Adding text {0} with relevance {1}", factsUsedCount, relevance);
+
+            facts.Append(fact);
+            tokensAvailable -= size;
+
+            this.MapMatchToCitation(index, relevantSources, memory, relevance);
+
+            // In cases where a buggy storage connector is returning too many records
+            if (factsUsedCount >= this._config.MaxMatchesCount)
+            {
+                break;
+            }
+        }
+
+        return (facts.ToString(), relevantSources, factsUsedCount, factsAvailableCount);
     }
 }
