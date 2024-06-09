@@ -11,6 +11,8 @@ using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.Logging;
 using Microsoft.KernelMemory.Service.AspNetCore.Models;
 using System.IO;
+using System.Text.Json;
+using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.KernelMemory.DocumentStorage;
 
@@ -28,6 +30,7 @@ public static class WebAPIEndpoints
         builder.AddDeleteIndexesEndpoint(apiPrefix, authFilter);
         builder.AddDeleteDocumentsEndpoint(apiPrefix, authFilter);
         builder.AddAskEndpoint(apiPrefix, authFilter);
+        builder.AddAskStreamEndpoint(apiPrefix, authFilter);
         builder.AddSearchEndpoint(apiPrefix, authFilter);
         builder.AddUploadStatusEndpoint(apiPrefix, authFilter);
         builder.AddGetDownloadEndpoint(apiPrefix, authFilter);
@@ -218,6 +221,41 @@ public static class WebAPIEndpoints
                     return Results.Ok(answer);
                 })
             .Produces<MemoryAnswer>(StatusCodes.Status200OK)
+            .Produces<ProblemDetails>(StatusCodes.Status401Unauthorized)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden);
+
+        if (authFilter != null) { route.AddEndpointFilter(authFilter); }
+    }
+
+    public static void AddAskStreamEndpoint(
+        this IEndpointRouteBuilder builder, string apiPrefix = "/", IEndpointFilter? authFilter = null)
+    {
+        RouteGroupBuilder group = builder.MapGroup(apiPrefix);
+
+        // Ask streaming endpoint
+        var route = group.MapPost(Constants.HttpAskStreamEndpoint, async Task (
+                HttpContext context,
+                MemoryQuery query,
+                IKernelMemory service,
+                ILogger<KernelMemoryWebAPI> log,
+                CancellationToken cancellationToken) =>
+            {
+                log.LogTrace("New search request, index '{0}', minRelevance {1}", query.Index, query.MinRelevance);
+                context.Response.Headers.Add("Content-Type", "text/event-stream");
+                var response = context.Response;
+
+                await foreach (var ma in service.AskStreamingAsync(
+                        question: query.Question,
+                        index: query.Index,
+                        filters: query.Filters,
+                        minRelevance: query.MinRelevance,
+                        cancellationToken: cancellationToken))
+                {
+                    await response.WriteAsync($"data: {JsonSerializer.Serialize(new { message = ma }, new JsonSerializerOptions { IgnoreNullValues = true })}\n\n", cancellationToken).ConfigureAwait(false);
+                    await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+                }
+            })
+            .Produces<IAsyncEnumerable<MemoryAnswer>>(StatusCodes.Status200OK)
             .Produces<ProblemDetails>(StatusCodes.Status401Unauthorized)
             .Produces<ProblemDetails>(StatusCodes.Status403Forbidden);
 
