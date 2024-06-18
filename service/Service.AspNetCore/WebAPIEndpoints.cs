@@ -15,11 +15,18 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Http.HttpResults;
 using Microsoft.KernelMemory.DocumentStorage;
+using System.Xml;
+using Microsoft.Extensions.Primitives;
+using System.Globalization;
+using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace Microsoft.KernelMemory.Service.AspNetCore;
 
 public static class WebAPIEndpoints
 {
+    private static readonly Dictionary<string, IAsyncEnumerable<MemoryAnswer>> s_askStreams = new();
+
     public static IEndpointRouteBuilder AddKernelMemoryEndpoints(
         this IEndpointRouteBuilder builder,
         string apiPrefix = "/",
@@ -34,6 +41,10 @@ public static class WebAPIEndpoints
         builder.AddSearchEndpoint(apiPrefix, authFilter);
         builder.AddUploadStatusEndpoint(apiPrefix, authFilter);
         builder.AddGetDownloadEndpoint(apiPrefix, authFilter);
+
+        // added by viu
+        builder.UseAddUrlEndpoint(apiPrefix, authFilter);
+        builder.UseAddSitemapEndpoint(apiPrefix, authFilter);
 
         return builder;
     }
@@ -233,30 +244,62 @@ public static class WebAPIEndpoints
         RouteGroupBuilder group = builder.MapGroup(apiPrefix);
 
         // Ask streaming endpoint
-        var route = group.MapPost(Constants.HttpAskStreamEndpoint, IResult (
+        var route = group.MapPost(Constants.HttpAskStreamEndpoint, async Task<IResult> (
+                HttpContext context,
                 MemoryQuery query,
                 IKernelMemory service,
                 ILogger<KernelMemoryWebAPI> log,
                 CancellationToken cancellationToken) =>
             {
                 log.LogTrace("New search request, index '{0}', minRelevance {1}", query.Index, query.MinRelevance);
-                return Results.Json(
-                    service.AskStreamingAsync(
-                        question: query.Question,
-                        index: query.Index,
-                        filters: query.Filters,
-                        minRelevance: query.MinRelevance,
-                        cancellationToken: cancellationToken),
-                    new JsonSerializerOptions
-                    {
-                        DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-                    });
+
+                var askId = Guid.NewGuid().ToString("N").Substring(0, 8);
+                s_askStreams.Add(askId, service.AskStreamingAsync(
+                    question: query.Question,
+                    index: query.Index,
+                    filters: query.Filters,
+                    minRelevance: query.MinRelevance,
+                    cancellationToken: cancellationToken));
+
+                return Results.Ok(new AskStreamResponse { AskId = askId });
             })
-            .Produces<IAsyncEnumerable<MemoryAnswer>>(StatusCodes.Status200OK)
+            .Produces<AskStreamResponse>(StatusCodes.Status200OK)
             .Produces<ProblemDetails>(StatusCodes.Status401Unauthorized)
             .Produces<ProblemDetails>(StatusCodes.Status403Forbidden);
 
         if (authFilter != null) { route.AddEndpointFilter(authFilter); }
+
+        // SSE endpoint
+        var sseRoute = group.MapGet($"{Constants.HttpAskStreamEndpoint}/{{askId}}", async Task (
+            HttpContext context,
+            ILogger<KernelMemoryWebAPI> log,
+            CancellationToken cancellationToken,
+            string askId) =>
+            {
+                log.LogTrace("Accessing SSE stream for askId '{0}'", askId);
+                context.Response.Headers.Add("Content-Type", "text/event-stream");
+                if (s_askStreams.TryGetValue(askId, out IAsyncEnumerable<MemoryAnswer>? stream))
+                {
+                    s_askStreams.Remove(askId);
+                    var jsonOptions = new JsonSerializerOptions { DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault };
+                    var response = context.Response;
+                    if (stream != null)
+                    {
+                        await foreach (var ma in stream)
+                        {
+                            await response.WriteAsync($"data: {JsonSerializer.Serialize(new { message = ma }, jsonOptions)}\n\n", cancellationToken).ConfigureAwait(false);
+                            await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        }
+
+                        // Send an end-of-stream event if needed
+                        await response.WriteAsync("event: end\ndata: End of stream\n\n", cancellationToken).ConfigureAwait(false);
+                        await response.Body.FlushAsync(cancellationToken).ConfigureAwait(false);
+                        return;
+                    }
+                }
+                context.Response.StatusCode = StatusCodes.Status404NotFound;
+                await context.Response.WriteAsync("Not found", cancellationToken).ConfigureAwait(false);
+            });
     }
 
     public static void AddSearchEndpoint(
@@ -416,8 +459,256 @@ public static class WebAPIEndpoints
         if (authFilter != null) { route.AddEndpointFilter(authFilter); }
     }
 
+    public static void UseAddUrlEndpoint(this IEndpointRouteBuilder builder, string apiPrefix = "/", IEndpointFilter? authFilter = null)
+    {
+        RouteGroupBuilder group = builder.MapGroup(apiPrefix);
+        // File upload endpoint
+        var route = group.MapPost("/addurl", async Task<IResult> (
+                HttpRequest request,
+                IKernelMemory service,
+                ILogger<KernelMemoryWebAPI> log,
+                CancellationToken cancellationToken) =>
+            {
+                log.LogTrace("New add url HTTP request, content length {0}", request.ContentLength);
+                // Note: .NET doesn't yet support binding multipart forms including data and files
+                (HttpAddUrlRequest input, bool isValid, string errMsg)
+                    = await HttpAddUrlRequest.BindHttpRequestAsync(request, cancellationToken)
+                        .ConfigureAwait(false);
+                log.LogTrace("Index '{0}'", input.Index);
+                if (!isValid)
+                {
+                    log.LogError(errMsg);
+                    return Results.Problem(detail: errMsg, statusCode: 400);
+                }
+                try
+                {
+                    //await s_memory.ImportWebPageAsync("https://raw.githubusercontent.com/microsoft/kernel-memory/main/README.md", documentId: "webPage1");
+                    // UploadRequest => Document
+                    var documentId = await service.ImportWebPageAsync(
+                        url: input.Url.ToString(),
+                        documentId: input.DocumentId,
+                        tags: input.Tags,
+                        index: input.Index,
+                        cancellationToken: cancellationToken)
+                    .ConfigureAwait(false);
+                    log.LogTrace("Doc Id '{1}'", documentId);
+                    var url = Constants.HttpUploadStatusEndpointWithParams
+                        .Replace(Constants.HttpIndexPlaceholder, input.Index, StringComparison.Ordinal)
+                        .Replace(Constants.HttpDocumentIdPlaceholder, documentId, StringComparison.Ordinal);
+                    return Results.Accepted(url, new UploadAccepted
+                    {
+                        DocumentId = documentId,
+                        Index = input.Index,
+                        Message = "Document upload completed, ingestion pipeline started"
+                    });
+                }
+                catch (Exception e)
+                {
+                    return Results.Problem(title: "Document upload failed", detail: e.Message, statusCode: 503);
+                }
+            })
+            .Produces<UploadAccepted>(StatusCodes.Status202Accepted)
+            .Produces<ProblemDetails>(StatusCodes.Status400BadRequest)
+            .Produces<ProblemDetails>(StatusCodes.Status401Unauthorized)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden)
+            .Produces<ProblemDetails>(StatusCodes.Status503ServiceUnavailable);
+
+        if (authFilter != null) { route.AddEndpointFilter(authFilter); }
+    }
+
+    public static void UseAddSitemapEndpoint(this IEndpointRouteBuilder builder, string apiPrefix = "/", IEndpointFilter? authFilter = null)
+    {
+        RouteGroupBuilder group = builder.MapGroup(apiPrefix);
+
+        // File upload endpoint
+        var route = group.MapPost("/addsitemap", async Task<IResult> (
+                HttpRequest request,
+                IKernelMemory service,
+                ILogger<KernelMemoryWebAPI> log,
+                //IHttpClientFactory clientFactory,
+                CancellationToken cancellationToken) =>
+            {
+                log.LogTrace("New add sitemap HTTP request, content length {0}", request.ContentLength);
+                // Note: .NET doesn't yet support binding multipart forms including data and files
+                (HttpAddUrlRequest input, bool isValid, string errMsg)
+                    = await HttpAddUrlRequest.BindHttpRequestAsync(request, cancellationToken)
+                        .ConfigureAwait(false);
+                log.LogTrace("Index '{0}'", input.Index);
+                if (!isValid)
+                {
+                    log.LogError(errMsg);
+                    return Results.Problem(detail: errMsg, statusCode: 400);
+                }
+                try
+                {
+                    // get http client and use it to retrieve sitemap xml from "url"
+                    /*var client = clientFactory.CreateClient();
+                    var response = await client.GetAsync(input.Url, cancellationToken).ConfigureAwait(false);
+                    response.EnsureSuccessStatusCode();
+                    var sitemap = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);*/
+                    var docIds = new List<string>();
+                    // Load the sitemap XML from the URL
+                    var doc = new XmlDocument();
+                    doc.Load(input.Url.ToString());
+                    // Namespace manager for handling namespaces in the XML
+                    var manager = new XmlNamespaceManager(doc.NameTable);
+                    manager.AddNamespace("ns", "http://www.sitemaps.org/schemas/sitemap/0.9");
+                    // Select all <url> nodes and iterate over them
+                    var nodes = doc.SelectNodes("//ns:url/ns:loc", manager);
+                    foreach (XmlNode node in nodes)
+                    {
+                        var documentId = await service.ImportWebPageAsync(
+                            documentId: WebAPIEndpoints.GetDocumentIdFromUrl(node.InnerText),
+                            url: node.InnerText,
+                            tags: input.Tags,
+                            index: input.Index,
+                            cancellationToken: cancellationToken).ConfigureAwait(false);
+                        Console.WriteLine("added " + node.InnerText);
+                        docIds.Add(documentId);
+                        // wait for 1 second to avoid rate limiting
+                        await Task.Delay(2000, cancellationToken).ConfigureAwait(false);
+                    }
+                    log.LogTrace("Doc Ids '{1}'", string.Join(',', docIds));
+                    var url = Constants.HttpUploadStatusEndpointWithParams
+                        .Replace(Constants.HttpIndexPlaceholder, input.Index, StringComparison.Ordinal)
+                        .Replace(Constants.HttpDocumentIdPlaceholder, string.Join(',', docIds), StringComparison.Ordinal);
+                    return Results.Accepted(url, new UploadAccepted
+                    {
+                        DocumentId = string.Join(',', docIds),
+                        Index = input.Index,
+                        Message = "Document upload completed, ingestion pipeline started"
+                    });
+                }
+                catch (Exception e)
+                {
+                    return Results.Problem(title: "Document upload failed", detail: e.Message, statusCode: 503);
+                }
+            })
+            .Produces<UploadAccepted>(StatusCodes.Status202Accepted)
+            .Produces<ProblemDetails>(StatusCodes.Status400BadRequest)
+            .Produces<ProblemDetails>(StatusCodes.Status401Unauthorized)
+            .Produces<ProblemDetails>(StatusCodes.Status403Forbidden)
+            .Produces<ProblemDetails>(StatusCodes.Status503ServiceUnavailable);
+
+        if (authFilter != null) { route.AddEndpointFilter(authFilter); }
+    }
+
+
+
+    private static string? GetDocumentIdFromUrl(string url)
+    {
+        var id = url?.Replace("https://", "", StringComparison.OrdinalIgnoreCase).Replace("http://", "", StringComparison.OrdinalIgnoreCase).Replace("/", "_", StringComparison.OrdinalIgnoreCase).Replace(".", "_", StringComparison.OrdinalIgnoreCase).ToUpperInvariant();
+        return id == null ? null : Regex.Replace(id, @"[^A-Za-z0-9._-]", "_");
+    }
+
 #pragma warning disable CA1812 // used by logger, can't be static
     // Class used to tag log entries and allow log filtering
     private sealed class KernelMemoryWebAPI;
 #pragma warning restore CA1812
+
+    public class HttpAddUrlRequest
+    {
+        public string Index { get; set; } = string.Empty;
+        public string DocumentId { get; set; } = string.Empty;
+        public TagCollection Tags { get; set; } = new();
+        public List<string> Steps { get; set; } = new();
+        public Uri Url { get; set; } = null!;
+
+        /* Resources:
+         * https://learn.microsoft.com/en-us/aspnet/core/mvc/models/file-uploads?view=aspnetcore-7.0
+         * https://learn.microsoft.com/en-us/aspnet/core/mvc/models/file-uploads?view=aspnetcore-7.0#upload-large-files-with-streaming
+         * https://stackoverflow.com/questions/71499435/how-do-i-do-file-upload-using-asp-net-core-6-minimal-api
+         * https://stackoverflow.com/questions/57033535/multipartformdatacontent-add-stringcontent-is-adding-carraige-return-linefeed-to
+         */
+        public static async Task<(HttpAddUrlRequest model, bool isValid, string errMsg)> BindHttpRequestAsync(
+            HttpRequest httpRequest, CancellationToken cancellationToken = default)
+        {
+            var result = new HttpAddUrlRequest();
+
+            // Read form
+            IFormCollection form = await httpRequest.ReadFormAsync(cancellationToken).ConfigureAwait(false);
+
+            // Only one index can be defined
+            if (form.TryGetValue(Constants.WebServiceIndexField, out StringValues indexes) && indexes.Count > 1)
+            {
+                return (result, false, $"Invalid index name, '{Constants.WebServiceIndexField}', multiple values provided");
+            }
+
+            // Only one document ID can be defined
+            if (form.TryGetValue(Constants.WebServiceDocumentIdField, out StringValues documentIds) && documentIds.Count > 1)
+            {
+                return (result, false, $"Invalid document ID, '{Constants.WebServiceDocumentIdField}' must be a single value, not a list");
+            }
+
+            // Document Id is optional, e.g. used if the client wants to retry the same upload, otherwise a random/unique one is generated
+            string? documentId = documentIds.FirstOrDefault();
+            if (string.IsNullOrWhiteSpace(documentId))
+            {
+                documentId = DateTimeOffset.Now.ToString("yyyyMMdd.HHmmss.", CultureInfo.InvariantCulture) + Guid.NewGuid().ToString("N");
+            }
+
+            // exactly one url needs to be provided
+            if (!form.TryGetValue("url", out StringValues urlString) || urlString.Count != 1 || !Uri.TryCreate(urlString.FirstOrDefault(), UriKind.Absolute, out Uri url))
+            {
+                return (result, false, $"Invalid URL, 'url' must be a single valid URL");
+            }
+
+            // Optional document tags. Tags are passed in as "key:value", where a key can have multiple values. See TagCollection.
+            if (form.TryGetValue(Constants.WebServiceTagsField, out StringValues tags))
+            {
+                foreach (string? tag in tags)
+                {
+                    if (tag == null) { continue; }
+
+                    var keyValue = tag.Trim().Split(Constants.ReservedEqualsChar, 2);
+                    string key = keyValue[0].Trim();
+                    if (string.IsNullOrWhiteSpace(key)) { continue; }
+
+                    ValidateTagName(key);
+
+                    string? value = keyValue.Length == 1 ? null : keyValue[1].Trim();
+                    if (string.IsNullOrWhiteSpace(value)) { value = null; }
+
+                    result.Tags.Add(key, value);
+                }
+            }
+
+            // Optional pipeline steps. The user can pass a custom list or leave it to the system to use the default.
+            if (form.TryGetValue(Constants.WebServiceStepsField, out StringValues steps))
+            {
+                foreach (string? step in steps)
+                {
+                    if (string.IsNullOrWhiteSpace(step)) { continue; }
+
+                    // Allow step names to be separated by space, comma, semicolon
+                    var list = step.Replace(' ', ';').Replace(',', ';').Split(';');
+                    result.Steps.AddRange(from s in list where !string.IsNullOrWhiteSpace(s) select s.Trim());
+                }
+            }
+
+            result.Index = indexes.FirstOrDefault()?.Trim() ?? string.Empty;
+            result.DocumentId = documentId;
+            result.Url = url;
+
+            return (result, true, string.Empty);
+        }
+
+        private static void ValidateTagName(string tagName)
+        {
+            if (tagName.StartsWith(Constants.ReservedTagsPrefix, StringComparison.Ordinal))
+            {
+                throw new KernelMemoryException(
+                    $"The tag name prefix '{Constants.ReservedTagsPrefix}' is reserved for internal use.");
+            }
+
+            if (tagName is Constants.ReservedDocumentIdTag
+                or Constants.ReservedFileIdTag
+                or Constants.ReservedFilePartitionTag
+                or Constants.ReservedFileTypeTag
+                or Constants.ReservedSyntheticTypeTag)
+            {
+                throw new KernelMemoryException($"The tag name '{tagName}' is reserved for internal use.");
+            }
+        }
+    }
 }

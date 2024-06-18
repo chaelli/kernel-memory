@@ -15,6 +15,7 @@ using Microsoft.KernelMemory.Diagnostics;
 using Microsoft.KernelMemory.DocumentStorage;
 using Microsoft.KernelMemory.MemoryStorage;
 using Microsoft.KernelMemory.Pipeline;
+using Microsoft.KernelMemory.Prompts;
 using Microsoft.KernelMemory.Service.AspNetCore;
 
 // KM Configuration:
@@ -85,6 +86,7 @@ internal static class Program
         appBuilder.AddKernelMemory(memoryBuilder =>
             {
                 memoryBuilder.FromAppSettings().WithoutDefaultHandlers();
+                memoryBuilder.WithCustomPromptProvider(new ViuPromptProvider());
 
                 // When using distributed orchestration, handlers are hosted in the current app and need to be con
                 asyncHandlersCount = AddHandlersAsHostedServices(config, memoryBuilder, appBuilder);
@@ -222,5 +224,27 @@ internal static class Program
         }
 
         return orchestrator.HandlerNames.Count;
+    }
+}
+
+internal class ViuPromptProvider : IPromptProvider
+{
+    private const string AskPrompt = """
+            Facts:
+            {{$facts}}
+            ======
+            Given only the facts above, provide a comprehensive/detailed answer.
+            You don't know where the knowledge comes from, just answer.
+            If you don't have sufficient information, reply with '{{$notFound}}'.
+            Format all links, email, phonenumbers with markdown, to make them interactive. Make sure to use correct indentation for lists you create in markdown.
+            For every paragraph, add the source to end of the paragraph. Make it markdown formatted and use ↗️ as linktext (nothing more -  not even "source")
+            When writing in German - never use ß - always use ss instead.
+            Question: {{$input}}
+            Answer:
+            """;
+
+    public string ReadPrompt(string promptName)
+    {
+        return AskPrompt;
     }
 }
